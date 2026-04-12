@@ -9,28 +9,105 @@ import { doc, setDoc, getDoc, serverTimestamp } from 'firebase/firestore'
 import { auth, db } from '../firebase'
 
 const AuthContext = createContext(null)
+const USERS_KEY = 'chatgaiyyaalap_users'
+
+function getStoredUsers() {
+  try {
+    return JSON.parse(localStorage.getItem(USERS_KEY)) || []
+  } catch {
+    return []
+  }
+}
+
+function storeUsers(users) {
+  localStorage.setItem(USERS_KEY, JSON.stringify(users))
+}
+
+function findStoredUser({ uid, email }) {
+  const users = getStoredUsers()
+  return users.find((u) =>
+    (uid && (u.uid === uid || u.id === uid)) ||
+    (email && u.email === email),
+  )
+}
+
+function upsertLocalUser(profile) {
+  if (!profile?.uid && !profile?.id && !profile?.email) return
+
+  const uid = profile.uid || profile.id
+  const normalizedRole = (profile.role || '').toLowerCase()
+  const nextUser = {
+    id: uid || profile.id || '',
+    uid: uid || profile.uid || '',
+    email: profile.email || '',
+    name: profile.name || profile.displayName || '',
+    displayName: profile.displayName || profile.name || '',
+    role: normalizedRole,
+    avatar: profile.avatar || '',
+  }
+
+  const users = getStoredUsers()
+  const index = users.findIndex((u) =>
+    (uid && (u.uid === uid || u.id === uid)) ||
+    (nextUser.email && u.email === nextUser.email),
+  )
+
+  if (index >= 0) {
+    users[index] = { ...users[index], ...nextUser }
+  } else {
+    users.unshift(nextUser)
+  }
+
+  storeUsers(users)
+}
 
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null)
   const [loading, setLoading] = useState(true)
 
+  async function hydrateUser(firebaseUser, fallback = {}) {
+    let profile = {}
+    const cachedUser = findStoredUser({
+      uid: firebaseUser.uid,
+      email: firebaseUser.email || fallback.email,
+    })
+
+    try {
+      const profileSnap = await getDoc(doc(db, 'users', firebaseUser.uid))
+      if (profileSnap.exists()) profile = profileSnap.data()
+    } catch {
+      // Keep auth usable even when profile read fails.
+    }
+
+    const name = profile.displayName || profile.name || fallback.name || cachedUser?.name || ''
+    const role = (profile.role || fallback.role || cachedUser?.role || '').toLowerCase()
+    const mergedUser = {
+      ...cachedUser,
+      ...profile,
+      id: firebaseUser.uid,
+      uid: firebaseUser.uid,
+      email: firebaseUser.email || profile.email || fallback.email || '',
+      name,
+      displayName: profile.displayName || name,
+      role,
+    }
+
+    setUser(mergedUser)
+    upsertLocalUser(mergedUser)
+    return mergedUser
+  }
+
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
-      if (firebaseUser) {
-        const profileSnap = await getDoc(doc(db, 'users', firebaseUser.uid))
-        const profile = profileSnap.exists() ? profileSnap.data() : {}
-        setUser({
-          id: firebaseUser.uid,
-          uid: firebaseUser.uid,
-          email: firebaseUser.email,
-          name: profile.displayName || profile.name || '',
-          role: profile.role || '',
-          ...profile,
-        })
-      } else {
-        setUser(null)
+      try {
+        if (firebaseUser) {
+          await hydrateUser(firebaseUser)
+        } else {
+          setUser(null)
+        }
+      } finally {
+        setLoading(false)
       }
-      setLoading(false)
     })
     return unsubscribe
   }, [])
@@ -45,6 +122,15 @@ export function AuthProvider({ children }) {
         role,
         createdAt: serverTimestamp(),
       })
+      upsertLocalUser({
+        id: cred.user.uid,
+        uid: cred.user.uid,
+        email,
+        name,
+        displayName: name,
+        role,
+      })
+      await hydrateUser(cred.user, { name, role, email })
       return { success: true }
     } catch (err) {
       let message = 'Registration failed.'
@@ -59,7 +145,13 @@ export function AuthProvider({ children }) {
 
   async function login({ email, password }) {
     try {
-      await signInWithEmailAndPassword(auth, email, password)
+      const cred = await signInWithEmailAndPassword(auth, email, password)
+      const cachedUser = findStoredUser({ uid: cred.user.uid, email })
+      await hydrateUser(cred.user, {
+        email,
+        role: cachedUser?.role,
+        name: cachedUser?.name,
+      })
       return { success: true }
     } catch (err) {
       let message = 'Invalid email or password.'
@@ -78,7 +170,11 @@ export function AuthProvider({ children }) {
     if (!user) return { success: false, message: 'Not logged in.' }
     try {
       await setDoc(doc(db, 'users', user.uid), updates, { merge: true })
-      setUser((prev) => ({ ...prev, ...updates }))
+      setUser((prev) => {
+        const updated = { ...prev, ...updates }
+        upsertLocalUser(updated)
+        return updated
+      })
       return { success: true }
     } catch {
       return { success: false, message: 'Failed to update profile.' }

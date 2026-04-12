@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { useLanguage } from '../context/LanguageContext'
@@ -6,11 +6,17 @@ import { LanguageIcon } from '@heroicons/react/24/outline'
 import toast from 'react-hot-toast'
 
 export default function LoginPage() {
-  const { login } = useAuth()
+  const { login, isAuthenticated, loading } = useAuth()
   const { t } = useLanguage()
   const navigate = useNavigate()
   const [form, setForm] = useState({ email: '', password: '' })
   const [error, setError] = useState('')
+
+  useEffect(() => {
+    if (!loading && isAuthenticated) {
+      navigate('/translate', { replace: true })
+    }
+  }, [loading, isAuthenticated, navigate])
 
   function handleChange(e) {
     setForm((f) => ({ ...f, [e.target.name]: e.target.value }))

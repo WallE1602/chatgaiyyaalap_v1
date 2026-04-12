@@ -40,8 +40,12 @@ function getPatients() {
   try {
     const users = JSON.parse(localStorage.getItem(USERS_KEY)) || []
     return users
-      .filter((u) => u.role === 'patient')
-      .map(({ password, ...rest }) => rest)
+      .filter((u) => (u.role || '').toLowerCase() === 'patient')
+      .map(({ password, ...rest }) => ({
+        ...rest,
+        id: rest.id || rest.uid || rest.email || crypto.randomUUID(),
+        name: rest.name || rest.displayName || rest.email || 'Unknown Patient',
+      }))
   } catch {
     return []
   }
