@@ -29,8 +29,7 @@ export default function PhraseLibraryPage() {
   }
 
   const handlePhraseClick = (phrase) => {
-    localStorage.setItem('pendingTranslation', phrase.chittagonian)
-    navigate('/translate')
+    navigate('/translate', { state: { prefill: phrase.chittagonian } })
   }
 
   return (

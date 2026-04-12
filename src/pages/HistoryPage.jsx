@@ -7,32 +7,56 @@ import {
   TrashIcon,
   ArrowRightIcon,
   ClipboardDocumentIcon,
+  UserIcon,
+  ChevronDownIcon,
+  ChevronUpIcon,
 } from '@heroicons/react/24/outline'
 import { useLanguage } from '../context/LanguageContext'
 import { useAuth } from '../context/AuthContext'
 import { db } from '../firebase'
-import { collection, query, where, orderBy, getDocs, deleteDoc, doc } from 'firebase/firestore'
+import { collection, query, where, getDocs, deleteDoc, doc } from 'firebase/firestore'
 
 export default function HistoryPage() {
   const { t } = useLanguage()
   const { user } = useAuth()
   const navigate = useNavigate()
 
-  const [translations, setTranslations] = useState([])
+  const [conversations, setConversations] = useState([])
   const [loading, setLoading] = useState(true)
+  const [expandedId, setExpandedId] = useState(null)
 
   useEffect(() => {
     if (!user?.uid) { setLoading(false); return }
-    const q = query(
-      collection(db, 'translations'),
-      where('userId', '==', user.uid),
-      orderBy('timestamp', 'desc'),
+    // Query ended conversations where user is doctor OR patient
+    // Firestore doesn't support OR across fields, so we run two queries
+    const isDoctor = user?.role === 'doctor'
+    const q1 = query(
+      collection(db, 'conversations'),
+      where('doctorId', '==', user.uid),
+      where('status', '==', 'ended'),
     )
-    getDocs(q)
-      .then((snap) => {
-        setTranslations(snap.docs.map((d) => ({ id: d.id, ...d.data() })))
+    const q2 = query(
+      collection(db, 'conversations'),
+      where('patientId', '==', user.uid),
+      where('status', '==', 'ended'),
+    )
+
+    Promise.all([getDocs(q1), getDocs(q2)])
+      .then(([snap1, snap2]) => {
+        const docMap = new Map()
+        ;[...snap1.docs, ...snap2.docs].forEach((d) => {
+          if (!docMap.has(d.id)) docMap.set(d.id, { id: d.id, ...d.data() })
+        })
+        const docs = Array.from(docMap.values())
+        docs.sort((a, b) => {
+          const ta = a.updatedAt?.toMillis?.() || 0
+          const tb = b.updatedAt?.toMillis?.() || 0
+          return tb - ta
+        })
+        setConversations(docs)
       })
-      .catch(() => {
+      .catch((err) => {
+        console.error('Failed to load conversations:', err)
         toast.error('Failed to load history')
       })
       .finally(() => setLoading(false))
@@ -40,8 +64,8 @@ export default function HistoryPage() {
 
   const handleDelete = async (id) => {
     try {
-      await deleteDoc(doc(db, 'translations', id))
-      setTranslations((prev) => prev.filter((t) => t.id !== id))
+      await deleteDoc(doc(db, 'conversations', id))
+      setConversations((prev) => prev.filter((c) => c.id !== id))
       toast.success(t('history.deleteConfirm'))
     } catch {
       toast.error('Failed to delete')
@@ -50,6 +74,10 @@ export default function HistoryPage() {
 
   const handleCopy = (text) => {
     navigator.clipboard.writeText(text).then(() => toast.success(t('translate.chatCopied')))
+  }
+
+  const toggleExpand = (id) => {
+    setExpandedId((prev) => (prev === id ? null : id))
   }
 
   const formatDate = (ts) => {
@@ -62,6 +90,12 @@ export default function HistoryPage() {
       hour: '2-digit',
       minute: '2-digit',
     })
+  }
+
+  const formatTime = (ts) => {
+    if (!ts) return ''
+    const d = new Date(ts)
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   }
 
   // ── Loading state ───────────────────────────────────────────────
@@ -88,13 +122,13 @@ export default function HistoryPage() {
         <p className="text-sm text-[#64748B]">{t('history.subtitle')}</p>
       </div>
 
-      {translations.length === 0 ? (
+      {conversations.length === 0 ? (
         /* Empty state */
         <div className="flex flex-col items-center justify-center py-20 text-center">
           <div className="w-16 h-16 rounded-2xl bg-[#0D9488]/10 flex items-center justify-center mb-4">
             <ChatBubbleLeftRightIcon className="h-8 w-8 text-[#0D9488]" />
           </div>
-          <h2 className="text-lg font-bold text-[#0F172A] mb-2">No translations yet</h2>
+          <h2 className="text-lg font-bold text-[#0F172A] mb-2">No conversations yet</h2>
           <p className="text-sm text-[#64748B] max-w-md mb-6">{t('history.noHistoryDesc')}</p>
           <button
             onClick={() => navigate('/translate')}
@@ -104,64 +138,110 @@ export default function HistoryPage() {
           </button>
         </div>
       ) : (
-        /* Translation records */
+        /* Conversation list */
         <div className="space-y-3">
-          {translations.map((rec) => (
-            <div
-              key={rec.id}
-              className="bg-white rounded-2xl border border-slate-200 p-5 hover:border-slate-300 hover:shadow-sm transition-all"
-            >
-              <div className="flex items-center gap-4">
-                {/* Chittagonian (left) */}
-                <div className="flex-1 min-w-0">
-                  <p className="text-[10px] font-semibold uppercase tracking-wider text-[#64748B] mb-1">Chittagonian</p>
-                  <p className="text-sm font-semibold text-[#1E293B] font-bengali truncate">{rec.chittagonian}</p>
-                </div>
+          {conversations.map((convo) => {
+            const msgs = convo.messages || []
+            const msgCount = msgs.length
+            const isExpanded = expandedId === convo.id
+            const previewUser = msgs.find((m) => m.role === 'user')
+            const previewBot = msgs.find((m) => m.role === 'bot')
 
-                <ArrowRightIcon className="h-4 w-4 text-[#94A3B8] flex-shrink-0" />
+            return (
+              <div
+                key={convo.id}
+                className="bg-white rounded-2xl border border-slate-200 hover:border-slate-300 hover:shadow-sm transition-all overflow-hidden"
+              >
+                {/* Card header */}
+                <div className="p-5">
+                  <div className="flex items-center justify-between gap-3">
+                    {/* Patient + meta */}
+                    <div className="flex items-center gap-3 min-w-0 flex-1">
+                      <div className="w-9 h-9 rounded-full bg-teal-50 flex items-center justify-center border border-teal-200 flex-shrink-0">
+                        <UserIcon className="h-4 w-4 text-[#0D9488]" />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold text-[#1E293B] truncate">
+                          {convo.patientName || 'Patient'}
+                        </p>
+                        <div className="flex items-center gap-2 text-[11px] text-[#94A3B8]">
+                          <span>{msgCount} message{msgCount !== 1 ? 's' : ''}</span>
+                          <span>·</span>
+                          <ClockIcon className="h-3 w-3" />
+                          <span>{formatDate(convo.updatedAt || convo.createdAt)}</span>
+                        </div>
+                      </div>
+                    </div>
 
-                {/* Bangla (right) */}
-                <div className="flex-1 min-w-0">
-                  <p className="text-[10px] font-semibold uppercase tracking-wider text-[#64748B] mb-1">Standard Bangla</p>
-                  <p className="text-sm text-[#1E293B] font-bengali truncate">{rec.bangla}</p>
-                </div>
+                    {/* Actions */}
+                    <div className="flex items-center gap-2 flex-shrink-0">
+                      <button
+                        onClick={() => toggleExpand(convo.id)}
+                        title={isExpanded ? 'Collapse' : 'Expand'}
+                        className="p-1.5 rounded-lg border border-slate-200 text-[#64748B] hover:text-[#0D9488] hover:border-teal-400 transition-colors"
+                      >
+                        {isExpanded ? <ChevronUpIcon className="h-3.5 w-3.5" /> : <ChevronDownIcon className="h-3.5 w-3.5" />}
+                      </button>
+                      <button
+                        onClick={() => handleDelete(convo.id)}
+                        title="Delete"
+                        className="p-1.5 rounded-lg border border-slate-200 text-[#64748B] hover:text-red-500 hover:border-red-300 transition-colors"
+                      >
+                        <TrashIcon className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  </div>
 
-                {/* Actions */}
-                <div className="flex-shrink-0 flex items-center gap-2">
-                  {/* Match badge */}
-                  {rec.type === 'exact' || rec.type === 'keyword' ? (
-                    <span className="hidden sm:inline-flex px-2 py-0.5 rounded-full text-[10px] font-medium bg-green-50 text-green-700 border border-green-200">
-                      {rec.type}
-                    </span>
-                  ) : (
-                    <span className="hidden sm:inline-flex px-2 py-0.5 rounded-full text-[10px] font-medium bg-yellow-50 text-yellow-700 border border-yellow-200">
-                      not found
-                    </span>
+                  {/* Preview (collapsed) */}
+                  {!isExpanded && previewUser && (
+                    <div className="mt-3 flex items-center gap-3 text-sm">
+                      <div className="flex-1 min-w-0">
+                        <p className="text-[10px] font-semibold uppercase tracking-wider text-[#64748B] mb-0.5">Chittagonian</p>
+                        <p className="text-[#1E293B] font-bengali truncate">{previewUser.text}</p>
+                      </div>
+                      {previewBot && (
+                        <>
+                          <ArrowRightIcon className="h-3.5 w-3.5 text-[#94A3B8] flex-shrink-0" />
+                          <div className="flex-1 min-w-0">
+                            <p className="text-[10px] font-semibold uppercase tracking-wider text-[#64748B] mb-0.5">Bangla</p>
+                            <p className="text-[#1E293B] font-bengali truncate">{previewBot.text}</p>
+                          </div>
+                        </>
+                      )}
+                    </div>
                   )}
-                  <button
-                    onClick={() => handleCopy(rec.bangla)}
-                    title="Copy translation"
-                    className="p-1.5 rounded-lg border border-slate-200 text-[#64748B] hover:text-[#0D9488] hover:border-teal-400 transition-colors"
-                  >
-                    <ClipboardDocumentIcon className="h-3.5 w-3.5" />
-                  </button>
-                  <button
-                    onClick={() => handleDelete(rec.id)}
-                    title="Delete"
-                    className="p-1.5 rounded-lg border border-slate-200 text-[#64748B] hover:text-red-500 hover:border-red-300 transition-colors"
-                  >
-                    <TrashIcon className="h-3.5 w-3.5" />
-                  </button>
                 </div>
-              </div>
 
-              {/* Timestamp */}
-              <div className="mt-2 flex items-center gap-1.5 text-[11px] text-[#94A3B8]">
-                <ClockIcon className="h-3 w-3" />
-                {formatDate(rec.timestamp)}
+                {/* Expanded messages */}
+                {isExpanded && msgs.length > 0 && (
+                  <div className="border-t border-slate-100 px-5 py-4 space-y-3 bg-slate-50/50 max-h-96 overflow-y-auto">
+                    {msgs.map((msg, i) => (
+                      <div key={msg.id || i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                        <div
+                          className={`relative max-w-[80%] px-3.5 py-2.5 rounded-2xl text-sm ${
+                            msg.role === 'user'
+                              ? 'bg-[#0D9488] text-white rounded-br-md'
+                              : 'bg-white border border-slate-200 text-[#1E293B] rounded-bl-md'
+                          }`}
+                        >
+                          <p className="font-bengali whitespace-pre-wrap break-words">{msg.text}</p>
+                          <div className={`flex items-center gap-2 mt-1 text-[10px] ${msg.role === 'user' ? 'text-teal-200' : 'text-[#94A3B8]'}`}>
+                            <span>{formatTime(msg.timestamp)}</span>
+                            <button
+                              onClick={() => handleCopy(msg.text)}
+                              className={`p-0.5 rounded opacity-60 hover:opacity-100 transition-opacity ${msg.role === 'user' ? 'hover:text-white' : 'hover:text-[#0D9488]'}`}
+                            >
+                              <ClipboardDocumentIcon className="h-3 w-3" />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
-            </div>
-          ))}
+            )
+          })}
         </div>
       )}
     </main>

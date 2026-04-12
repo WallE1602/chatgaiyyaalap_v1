@@ -17,39 +17,9 @@ import {
 import { MicrophoneIcon as MicSolid } from '@heroicons/react/24/solid'
 import { lookupPhrase } from '../utils/phraseLookup'
 import { db } from '../firebase'
-import { collection, addDoc, serverTimestamp } from 'firebase/firestore'
+import { collection, addDoc, getDocs, getDoc, setDoc, deleteDoc, doc, query, where, serverTimestamp } from 'firebase/firestore'
 import { useLanguage } from '../context/LanguageContext'
 import { useAuth } from '../context/AuthContext'
-
-const CONVERSATIONS_KEY = 'chatgaiyyaalap_conversations'
-const USERS_KEY = 'chatgaiyyaalap_users'
-
-function getStoredConversations() {
-  try {
-    return JSON.parse(localStorage.getItem(CONVERSATIONS_KEY)) || []
-  } catch {
-    return []
-  }
-}
-
-function storeConversations(convos) {
-  localStorage.setItem(CONVERSATIONS_KEY, JSON.stringify(convos))
-}
-
-function getPatients() {
-  try {
-    const users = JSON.parse(localStorage.getItem(USERS_KEY)) || []
-    return users
-      .filter((u) => (u.role || '').toLowerCase() === 'patient')
-      .map(({ password, ...rest }) => ({
-        ...rest,
-        id: rest.id || rest.uid || rest.email || crypto.randomUUID(),
-        name: rest.name || rest.displayName || rest.email || 'Unknown Patient',
-      }))
-  } catch {
-    return []
-  }
-}
 
 let msgId = 0
 
@@ -63,18 +33,28 @@ export default function TranslationPage() {
   // Patient selection state (doctors only)
   const [selectedPatient, setSelectedPatient] = useState(null)
   const [patientSearch, setPatientSearch] = useState('')
-  const [showPatientPicker, setShowPatientPicker] = useState(isDoctor)
+  const [showPatientPicker, setShowPatientPicker] = useState(false)
+
+  // Keep showPatientPicker in sync when user/role loads
+  useEffect(() => {
+    if (isDoctor && !selectedPatient) setShowPatientPicker(true)
+  }, [isDoctor])
 
   const [messages, setMessages] = useState([])
   const [inputText, setInputText] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [isListening, setIsListening] = useState(false)
   const [fromLang, setFromLang] = useState('chittagonian')
+  const [conversationId, setConversationId] = useState(null)
+  const [convoLoading, setConvoLoading] = useState(true)
 
   const chatEndRef = useRef(null)
   const inputRef = useRef(null)
   const recognitionRef = useRef(null)
   const silenceTimerRef = useRef(null)
+  const draftTimerRef = useRef(null)
+  const inputTextRef = useRef(inputText)
+  inputTextRef.current = inputText
 
   const toLang = fromLang === 'chittagonian' ? 'bangla' : 'chittagonian'
 
@@ -83,8 +63,30 @@ export default function TranslationPage() {
     bangla: t('translate.bangla'),
   }
 
-  // ── Patient search ──────────────────────────────────────────────
-  const allPatients = getPatients()
+  // ── Fetch patients from Firestore (doctors only) ────────────────
+  const [allPatients, setAllPatients] = useState([])
+
+  useEffect(() => {
+    if (!isDoctor || !user?.uid) return
+    const q = query(collection(db, 'users'), where('role', '==', 'patient'))
+    getDocs(q)
+      .then((snap) => {
+        setAllPatients(
+          snap.docs.map((d) => {
+            const data = d.data()
+            return {
+              id: d.id,
+              uid: d.id,
+              name: data.displayName || data.name || data.email || 'Unknown Patient',
+              email: data.email || '',
+              avatar: data.avatar || null,
+            }
+          }),
+        )
+      })
+      .catch((err) => console.error('Fetch patients failed:', err))
+  }, [isDoctor, user?.uid])
+
   const filteredPatients = patientSearch.trim()
     ? allPatients.filter(
         (p) =>
@@ -93,50 +95,152 @@ export default function TranslationPage() {
       )
     : allPatients
 
-  const handleSelectPatient = (patient) => {
+  const handleSelectPatient = async (patient) => {
     setSelectedPatient(patient)
     setShowPatientPicker(false)
     setPatientSearch('')
     setMessages([])
+    setConversationId(null)
+    // Load active conversation for this patient
+    await loadActiveConversation(patient.id)
   }
 
-  const handleChangePatient = () => {
-    // Save current conversation if messages exist before switching
-    if (messages.length > 0 && selectedPatient) {
-      saveConversation()
+  const handleChangePatient = async () => {
+    // End current conversation if messages exist before switching
+    if (messages.length > 0 && conversationId) {
+      await endConversation(true)
     }
     setSelectedPatient(null)
     setShowPatientPicker(true)
     setMessages([])
+    setConversationId(null)
   }
 
-  // ── Save conversation ───────────────────────────────────────────
-  const saveConversation = (silent = false) => {
+  // ── Load active conversation from Firestore ─────────────────────
+  const loadActiveConversation = async (patientId) => {
+    if (!user?.uid) return
+    setConvoLoading(true)
+    try {
+      // Doctor queries by doctorId, patient queries by patientId
+      const ownerField = isDoctor ? 'doctorId' : 'patientId'
+      const constraints = [
+        where(ownerField, '==', user.uid),
+        where('status', '==', 'active'),
+      ]
+      if (isDoctor && patientId) constraints.push(where('patientId', '==', patientId))
+
+      const q = query(collection(db, 'conversations'), ...constraints)
+      const snap = await getDocs(q)
+      if (!snap.empty) {
+        // Pick the most recently updated conversation
+        const docs = snap.docs.map((d) => ({ id: d.id, ...d.data() }))
+        docs.sort((a, b) => {
+          const ta = a.updatedAt?.toMillis?.() || 0
+          const tb = b.updatedAt?.toMillis?.() || 0
+          return tb - ta
+        })
+        const best = docs[0]
+        setConversationId(best.id)
+        setMessages(best.messages || [])
+        if (best.fromLang) setFromLang(best.fromLang)
+        // Restore msgId counter to avoid collisions
+        const maxId = (best.messages || []).reduce((max, m) => Math.max(max, m.id || 0), 0)
+        msgId = maxId
+        // For doctors, restore patient
+        if (isDoctor && best.patientId && !patientId) {
+          const patient = allPatients.find((p) => p.id === best.patientId)
+          if (patient) {
+            setSelectedPatient(patient)
+            setShowPatientPicker(false)
+          }
+        }
+      }
+    } catch (err) {
+      console.error('loadActiveConversation failed:', err)
+    } finally {
+      setConvoLoading(false)
+    }
+  }
+
+  // ── Persist conversation to Firestore ───────────────────────────
+  const persistConversation = async (msgs, convoId) => {
+    if (!user?.uid) return convoId
+
+    // If no convoId yet, check if the other party already created one
+    if (!convoId) {
+      const lookupField = isDoctor ? 'doctorId' : 'patientId'
+      const otherField = isDoctor ? 'patientId' : 'doctorId'
+      const otherValue = isDoctor ? (selectedPatient?.id || null) : null
+      const constraints = [
+        where(lookupField, '==', user.uid),
+        where('status', '==', 'active'),
+      ]
+      if (otherValue) constraints.push(where(otherField, '==', otherValue))
+      try {
+        const existingSnap = await getDocs(query(collection(db, 'conversations'), ...constraints))
+        if (!existingSnap.empty) {
+          convoId = existingSnap.docs[0].id
+        }
+      } catch { /* proceed to create new */ }
+    }
+
+    const data = {
+      doctorId: isDoctor ? user.uid : null,
+      doctorName: isDoctor ? user.name : null,
+      patientId: isDoctor ? (selectedPatient?.id || null) : user.uid,
+      patientName: isDoctor ? (selectedPatient?.name || 'Unknown') : user.name,
+      status: 'active',
+      fromLang,
+      messages: msgs,
+      updatedAt: serverTimestamp(),
+    }
+
+    if (convoId) {
+      await setDoc(doc(db, 'conversations', convoId), data, { merge: true })
+      return convoId
+    } else {
+      data.createdAt = serverTimestamp()
+      const ref = await addDoc(collection(db, 'conversations'), data)
+      return ref.id
+    }
+  }
+
+  // ── End / save conversation ─────────────────────────────────────
+  const endConversation = async (silent = false) => {
     if (messages.length === 0) {
       if (!silent) toast.error(t('translate.noMessagesToSave'))
       return
     }
-
-    const convo = {
-      id: crypto.randomUUID(),
-      userId: user.id,
-      doctorId: isDoctor ? user.id : null,
-      doctorName: isDoctor ? user.name : null,
-      patientId: isDoctor ? (selectedPatient?.id || null) : user.id,
-      patientName: isDoctor ? (selectedPatient?.name || 'Unknown') : user.name,
-      messages: [...messages],
-      createdAt: messages[0]?.timestamp || Date.now(),
-      endedAt: Date.now(),
+    try {
+      if (conversationId) {
+        await setDoc(doc(db, 'conversations', conversationId), { status: 'ended', updatedAt: serverTimestamp() }, { merge: true })
+      } else {
+        // Create and immediately end
+        const data = {
+          doctorId: isDoctor ? user.uid : null,
+          doctorName: isDoctor ? user.name : null,
+          patientId: isDoctor ? (selectedPatient?.id || null) : user.uid,
+          patientName: isDoctor ? (selectedPatient?.name || 'Unknown') : user.name,
+          status: 'ended',
+          fromLang,
+          messages: [...messages],
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        }
+        await addDoc(collection(db, 'conversations'), data)
+      }
+      // Clear draft
+      deleteDoc(doc(db, 'drafts', user.uid)).catch(() => {})
+      if (!silent) toast.success(t('translate.conversationSaved'))
+    } catch {
+      if (!silent) toast.error('Failed to save conversation')
     }
-
-    const stored = getStoredConversations()
-    storeConversations([convo, ...stored])
-    if (!silent) toast.success(t('translate.conversationSaved'))
     setMessages([])
+    setConversationId(null)
   }
 
-  const handleSaveAndEnd = () => {
-    saveConversation()
+  const handleSaveAndEnd = async () => {
+    await endConversation()
     if (isDoctor) {
       setSelectedPatient(null)
       setShowPatientPicker(true)
@@ -148,7 +252,56 @@ export default function TranslationPage() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isLoading])
 
-  // Pre-fill from PhraseCard navigation
+  // ── Load active conversation + draft on mount ───────────────────
+  useEffect(() => {
+    if (!user?.uid) { setConvoLoading(false); return }
+    const init = async () => {
+      // Patients: load active conversation immediately
+      // Doctors: wait for patient selection (handled in handleSelectPatient)
+      if (!isDoctor) {
+        await loadActiveConversation()
+      } else {
+        setConvoLoading(false)
+      }
+      // Load draft
+      try {
+        const draftSnap = await getDoc(doc(db, 'drafts', user.uid))
+        if (draftSnap.exists() && draftSnap.data().text) {
+          setInputText(draftSnap.data().text)
+        }
+      } catch (err) {
+        console.error('Draft load failed:', err)
+      }
+    }
+    init()
+  }, [user?.uid])
+
+  // ── Save draft on unmount ──────────────────────────────────────
+  useEffect(() => {
+    return () => {
+      clearTimeout(draftTimerRef.current)
+      if (user?.uid && inputTextRef.current.trim()) {
+        setDoc(doc(db, 'drafts', user.uid), { text: inputTextRef.current, updatedAt: serverTimestamp() }).catch(() => {})
+      } else if (user?.uid) {
+        deleteDoc(doc(db, 'drafts', user.uid)).catch(() => {})
+      }
+    }
+  }, [user?.uid])
+
+  // ── Debounced draft save on input change ───────────────────────
+  useEffect(() => {
+    if (!user?.uid) return
+    clearTimeout(draftTimerRef.current)
+    draftTimerRef.current = setTimeout(() => {
+      if (inputText.trim()) {
+        setDoc(doc(db, 'drafts', user.uid), { text: inputText, updatedAt: serverTimestamp() }).catch(() => {})
+      } else {
+        deleteDoc(doc(db, 'drafts', user.uid)).catch(() => {})
+      }
+    }, 800)
+  }, [inputText, user?.uid])
+
+  // Pre-fill from PhraseCard / PhraseLibrary navigation
   useEffect(() => {
     const state = location.state
     if (state?.prefill) {
@@ -159,16 +312,6 @@ export default function TranslationPage() {
     }
   }, [location.state])
 
-  // Pre-fill from PhraseLibrary localStorage
-  useEffect(() => {
-    const pending = localStorage.getItem('pendingTranslation')
-    if (pending) {
-      setInputText(pending)
-      localStorage.removeItem('pendingTranslation')
-      setTimeout(() => inputRef.current?.focus(), 100)
-    }
-  }, [])
-
   // ── Send message & translate ────────────────────────────────────────────
   const handleSend = useCallback(
     async (text, inputMode = 'text') => {
@@ -178,6 +321,8 @@ export default function TranslationPage() {
       const userMsg = {
         id: ++msgId,
         role: 'user',
+        senderUid: user.uid,
+        senderName: user.name || user.email,
         text: trimmed,
         inputMode,
         fromLang,
@@ -203,9 +348,21 @@ export default function TranslationPage() {
           toLang,
           timestamp: Date.now(),
         }
-        setMessages((prev) => [...prev, botMsg])
 
-        // Save to Firestore if logged in
+        const updatedMessages = [...messages, userMsg, botMsg]
+        setMessages(updatedMessages)
+
+        // Persist conversation to Firestore
+        persistConversation(updatedMessages, conversationId)
+          .then((newId) => { if (!conversationId) setConversationId(newId) })
+          .catch((err) => console.error('persistConversation failed:', err))
+
+        // Clear draft after successful send
+        if (user?.uid) {
+          deleteDoc(doc(db, 'drafts', user.uid)).catch(() => {})
+        }
+
+        // Save individual translation record
         if (user?.uid) {
           addDoc(collection(db, 'translations'), {
             userId: user.uid,
@@ -222,7 +379,7 @@ export default function TranslationPage() {
         inputRef.current?.focus()
       }
     },
-    [inputText, isLoading, fromLang, toLang, t],
+    [inputText, isLoading, fromLang, toLang, t, messages, conversationId, user],
   )
 
   // ── Swap languages ──────────────────────────────────────────────
@@ -238,12 +395,13 @@ export default function TranslationPage() {
   }
 
   // ── Clear chat ──────────────────────────────────────────────────
-  const handleClear = () => {
+  const handleClear = async () => {
     // Auto-save before clearing if there are messages
     if (messages.length > 0) {
-      saveConversation(true)
+      await endConversation(true)
     }
     setMessages([])
+    setConversationId(null)
     toast.success(t('translate.chatClearConfirm'))
   }
 
@@ -474,24 +632,36 @@ export default function TranslationPage() {
           </div>
         ) : (
           /* Messages */
-          messages.map((msg) => (
-            <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+          messages.map((msg) => {
+            // For user-sent messages: show on right if I sent it, left otherwise
+            // For bot (translation) messages: always show on left
+            const isMine = msg.role === 'user' && msg.senderUid === user?.uid
+            const isTranslation = msg.role === 'bot'
+            const showRight = isMine
+            // Legacy messages without senderUid: use old logic
+            const effectiveRight = msg.senderUid ? showRight : msg.role === 'user'
+
+            return (
+            <div key={msg.id} className={`flex ${effectiveRight ? 'justify-end' : 'justify-start'}`}>
               <div
                 className={`group relative max-w-[80%] sm:max-w-[70%] px-4 py-3 rounded-2xl ${
-                  msg.role === 'user'
+                  effectiveRight
                     ? 'bg-[#0D9488] text-white rounded-br-md'
                     : 'bg-white border border-slate-200 text-[#1E293B] rounded-bl-md shadow-sm'
                 }`}
               >
-                {/* Language tag */}
+                {/* Sender name + language tag */}
                 <div
                   className={`flex items-center gap-1.5 mb-1 text-[10px] font-semibold uppercase tracking-wider ${
-                    msg.role === 'user' ? 'text-teal-100' : 'text-[#64748B]'
+                    effectiveRight ? 'text-teal-100' : 'text-[#64748B]'
                   }`}
                 >
+                  {msg.role === 'user' && msg.senderName && msg.senderUid !== user?.uid && (
+                    <span className="capitalize">{msg.senderName} ·</span>
+                  )}
                   {msg.role === 'user' ? LANG_LABELS[msg.fromLang] : LANG_LABELS[msg.toLang]}
                   {msg.inputMode === 'voice' && (
-                    <MicrophoneIcon className={`h-3 w-3 ${msg.role === 'user' ? 'text-teal-200' : 'text-[#0D9488]'}`} />
+                    <MicrophoneIcon className={`h-3 w-3 ${effectiveRight ? 'text-teal-200' : 'text-[#0D9488]'}`} />
                   )}
                 </div>
 
@@ -501,14 +671,14 @@ export default function TranslationPage() {
                 {/* Timestamp + copy */}
                 <div
                   className={`flex items-center gap-2 mt-1.5 text-[10px] ${
-                    msg.role === 'user' ? 'text-teal-200' : 'text-[#94A3B8]'
+                    effectiveRight ? 'text-teal-200' : 'text-[#94A3B8]'
                   }`}
                 >
                   <span>{formatTime(msg.timestamp)}</span>
                   <button
                     onClick={() => handleCopy(msg.text)}
                     className={`opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded ${
-                      msg.role === 'user' ? 'hover:text-white' : 'hover:text-[#0D9488]'
+                      effectiveRight ? 'hover:text-white' : 'hover:text-[#0D9488]'
                     }`}
                     title={t('translate.chatCopyMessage')}
                   >
@@ -532,7 +702,8 @@ export default function TranslationPage() {
                 )}
               </div>
             </div>
-          ))
+            )
+          })
         )}
 
         {/* Loading indicator */}
