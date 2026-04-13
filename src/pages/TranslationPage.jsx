@@ -36,6 +36,8 @@ const makeThreadKey = (doctorId, patientId) => {
 
 const makeMessageId = (seed = 'msg') => `${seed}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 const LOCAL_ONGOING_KEY_PREFIX = 'chatgaiyyaalap_ongoing_conversation_'
+const VOICE_RECOGNITION_LANG = 'bn-BD'
+const VOICE_SILENCE_TIMEOUT_MS = 7000
 
 const getLocalOngoingKey = (uid) => `${LOCAL_ONGOING_KEY_PREFIX}${uid}`
 
@@ -140,6 +142,7 @@ export default function TranslationPage() {
   const inputRef = useRef(null)
   const recognitionRef = useRef(null)
   const silenceTimerRef = useRef(null)
+  const voiceStartGuardRef = useRef(false)
   const draftTimerRef = useRef(null)
   const inputTextRef = useRef(inputText)
   const messagesRef = useRef(messages)
@@ -557,6 +560,22 @@ export default function TranslationPage() {
   useEffect(() => {
     return () => {
       clearTimeout(draftTimerRef.current)
+      clearTimeout(silenceTimerRef.current)
+      voiceStartGuardRef.current = false
+      if (recognitionRef.current) {
+        recognitionRef.current.onstart = null
+        recognitionRef.current.onspeechstart = null
+        recognitionRef.current.onresult = null
+        recognitionRef.current.onend = null
+        recognitionRef.current.onerror = null
+        try {
+          recognitionRef.current.stop()
+        } catch {
+          // Ignore stop failures during unmount.
+        }
+        recognitionRef.current = null
+      }
+
       if (user?.uid && inputTextRef.current.trim()) {
         setDoc(doc(db, 'drafts', user.uid), { text: inputTextRef.current, updatedAt: serverTimestamp() }).catch(() => {})
       } else if (user?.uid) {
@@ -698,12 +717,25 @@ export default function TranslationPage() {
 
   // ── Voice Input ─────────────────────────────────────────────────
   const handleVoiceToggle = () => {
-    if (isListening) {
-      recognitionRef.current?.stop()
+    const stopRecognition = () => {
       clearTimeout(silenceTimerRef.current)
+      voiceStartGuardRef.current = false
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop()
+        } catch {
+          // Ignore invalid state transitions while stopping.
+        }
+      }
       setIsListening(false)
+    }
+
+    if (isListening) {
+      stopRecognition()
       return
     }
+
+    if (voiceStartGuardRef.current) return
 
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
     if (!SpeechRecognition) {
@@ -711,36 +743,109 @@ export default function TranslationPage() {
       return
     }
 
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop()
+      } catch {
+        // Ignore stale recognizer state.
+      }
+      recognitionRef.current = null
+    }
+
     const recognition = new SpeechRecognition()
-    recognition.lang = 'bn-BD'
+    const restartSilenceTimer = () => {
+      clearTimeout(silenceTimerRef.current)
+      silenceTimerRef.current = setTimeout(() => {
+        try {
+          recognition.stop()
+        } catch {
+          setIsListening(false)
+        }
+      }, VOICE_SILENCE_TIMEOUT_MS)
+    }
+
+    recognition.lang = VOICE_RECOGNITION_LANG
+    recognition.continuous = true
     recognition.interimResults = false
     recognition.maxAlternatives = 1
 
+    recognition.onstart = () => {
+      voiceStartGuardRef.current = false
+      setIsListening(true)
+      restartSilenceTimer()
+    }
+
+    recognition.onspeechstart = () => {
+      restartSilenceTimer()
+    }
+
     recognition.onresult = (e) => {
-      clearTimeout(silenceTimerRef.current)
-      const transcript = e.results[0][0].transcript
-      if (transcript.trim()) {
-        setInputText(transcript)
+      restartSilenceTimer()
+      const nextChunk = Array.from(e.results)
+        .slice(e.resultIndex)
+        .map((result) => result[0]?.transcript || '')
+        .join(' ')
+        .trim()
+
+      if (nextChunk) {
+        setInputText((prev) => {
+          const base = prev.trim()
+          return base ? `${base} ${nextChunk}` : nextChunk
+        })
       }
     }
+
     recognition.onend = () => {
       clearTimeout(silenceTimerRef.current)
       setIsListening(false)
+      voiceStartGuardRef.current = false
+      recognitionRef.current = null
     }
-    recognition.onerror = () => {
+
+    recognition.onerror = (event) => {
       clearTimeout(silenceTimerRef.current)
       setIsListening(false)
+      voiceStartGuardRef.current = false
+      recognitionRef.current = null
+
+      if (event?.error === 'aborted') return
+      if (event?.error === 'not-allowed' || event?.error === 'service-not-allowed') {
+        toast.error(t('translate.voicePermissionDenied'))
+        return
+      }
+      if (event?.error === 'audio-capture') {
+        toast.error(t('translate.voiceMicUnavailable'))
+        return
+      }
+      if (event?.error === 'no-speech') {
+        toast.error(t('translate.voiceNoSpeech'))
+        return
+      }
       toast.error(t('translate.voiceError'))
     }
 
     recognitionRef.current = recognition
-    recognition.start()
-    setIsListening(true)
+    voiceStartGuardRef.current = true
 
-    // Stop recording after 5 seconds of silence
-    silenceTimerRef.current = setTimeout(() => {
-      recognition.stop()
-    }, 5000)
+    try {
+      recognition.start()
+    } catch (err) {
+      clearTimeout(silenceTimerRef.current)
+      setIsListening(false)
+      voiceStartGuardRef.current = false
+      recognitionRef.current = null
+
+      if (err?.name === 'NotAllowedError') {
+        toast.error(t('translate.voicePermissionDenied'))
+        return
+      }
+      if (err?.name === 'InvalidStateError') {
+        toast.error(t('translate.voiceAlreadyRunning'))
+        return
+      }
+
+      toast.error(t('translate.voiceError'))
+    }
   }
 
   // ── Key handler ─────────────────────────────────────────────────
