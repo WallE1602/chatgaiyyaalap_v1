@@ -371,30 +371,6 @@ export default function TranslationPage() {
       ? (selectedPatient?.name || existingData?.patientName || 'Unknown')
       : (user.name || existingData?.patientName || 'Patient')
 
-    if (!doctorId && !isDoctor) {
-      try {
-        const endedSnap = await getDocs(
-          query(
-            collection(db, 'conversations'),
-            where('patientId', '==', user.uid),
-            where('status', '==', 'ended'),
-          ),
-        )
-        const endedDocs = endedSnap.docs
-          .map((d) => ({ id: d.id, ...d.data() }))
-          .filter((item) => !!item.doctorId)
-        endedDocs.sort((a, b) => toMillis(b.updatedAt) - toMillis(a.updatedAt))
-
-        if (endedDocs[0]) {
-          doctorId = endedDocs[0].doctorId
-          doctorName = endedDocs[0].doctorName || doctorName
-          setActiveDoctor({ id: doctorId, name: doctorName || 'Doctor' })
-        }
-      } catch (err) {
-        console.error('persistConversation ended lookup failed:', err)
-      }
-    }
-
     // Patient-side chats without a doctor thread are kept locally and should
     // not attempt cloud sync, which can trigger rule errors.
     if (!isDoctor && !doctorId) {
@@ -456,6 +432,27 @@ export default function TranslationPage() {
       if (!targetId) {
         targetId = await persistConversation([...messagesRef.current], null)
       }
+
+      // Patient self-session fallback: keep it out of doctor threads but allow
+      // the patient to save/view this session in history.
+      if (!targetId && !isDoctor) {
+        const selfRef = doc(collection(db, 'conversations'))
+        await setDoc(selfRef, {
+          doctorId: `self:${user.uid}`,
+          doctorName: 'Self Session',
+          patientId: user.uid,
+          patientName: user.name || user.email || 'Patient',
+          conversationType: 'patient_self',
+          threadKey: `patient_self__${user.uid}`,
+          status: 'ended',
+          fromLang,
+          messages: [...messagesRef.current],
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        }, { merge: true })
+        targetId = selfRef.id
+      }
+
       if (targetId) {
         await setDoc(doc(db, 'conversations', targetId), { status: 'ended', updatedAt: serverTimestamp() }, { merge: true })
       }
@@ -621,7 +618,7 @@ export default function TranslationPage() {
       try {
         // Small delay for smooth UX transition
         await new Promise((r) => setTimeout(r, 300))
-        const { result, matched, type } = lookupPhrase(trimmed)
+        const { result, matched, type } = lookupPhrase(trimmed, { fromLang, toLang })
         const botMsg = {
           id: makeMessageId('bot'),
           role: 'bot',

@@ -1,0 +1,3 @@
+PLACEHOLDER_MODEL_WEIGHTS
+This is not a real weight file.
+Replace with actual pytorch_model.bin (or sharded model files) for real inference.

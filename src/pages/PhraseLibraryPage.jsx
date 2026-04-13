@@ -19,7 +19,8 @@ export default function PhraseLibraryPage() {
         (p) =>
           p.chittagonian.includes(search) ||
           p.bangla.includes(search) ||
-          p.keywords.some((kw) => kw.includes(search)),
+          p.keywords.some((kw) => kw.includes(search)) ||
+          (p.bangla_keywords || []).some((kw) => kw.includes(search)),
       )
     : phrases
 
@@ -28,9 +29,10 @@ export default function PhraseLibraryPage() {
     setSearch('')
   }
 
-  const handlePhraseClick = (phrase) => {
+  const handlePhraseClick = (phrase, sourceLang) => {
+    const prefill = sourceLang === 'bangla' ? phrase.bangla : phrase.chittagonian
     navigate('/translate', {
-      state: { prefill: phrase.chittagonian, fromLang: 'chittagonian' },
+      state: { prefill, fromLang: sourceLang },
     })
   }
 
@@ -85,19 +87,34 @@ export default function PhraseLibraryPage() {
       {filtered.length > 0 ? (
         <div className="space-y-2">
           {filtered.map((phrase) => (
-            <button
+            <div
               key={phrase.id}
-              onClick={() => handlePhraseClick(phrase)}
-              className="group w-full flex items-center gap-4 bg-white rounded-xl border border-slate-200 px-5 py-4 hover:border-teal-400 hover:shadow-md transition-all focus:outline-none focus:ring-2 focus:ring-teal-400 text-left"
+              className="group w-full flex items-center gap-4 bg-white rounded-xl border border-slate-200 px-5 py-4 hover:border-teal-400 hover:shadow-md transition-all"
             >
-              <p className="flex-1 text-sm font-semibold text-[#1E293B] font-bengali">
-                {phrase.chittagonian}
-              </p>
+              <button
+                type="button"
+                onClick={() => handlePhraseClick(phrase, 'chittagonian')}
+                className="flex-1 text-left focus:outline-none focus:ring-2 focus:ring-teal-400 rounded-md px-1 py-0.5"
+                title="Use Chittagonian phrase in translator"
+              >
+                <p className="text-sm font-semibold text-[#1E293B] font-bengali">
+                  {phrase.chittagonian}
+                </p>
+              </button>
+
               <ArrowRightIcon className="h-4 w-4 text-[#94A3B8] flex-shrink-0 group-hover:text-[#0D9488] transition-colors" />
-              <p className="flex-1 text-sm text-[#64748B] font-bengali text-right">
-                {phrase.bangla}
-              </p>
-            </button>
+
+              <button
+                type="button"
+                onClick={() => handlePhraseClick(phrase, 'bangla')}
+                className="flex-1 text-right focus:outline-none focus:ring-2 focus:ring-teal-400 rounded-md px-1 py-0.5"
+                title="Use Standard Bangla phrase in translator"
+              >
+                <p className="text-sm text-[#64748B] font-bengali">
+                  {phrase.bangla}
+                </p>
+              </button>
+            </div>
           ))}
         </div>
       ) : (

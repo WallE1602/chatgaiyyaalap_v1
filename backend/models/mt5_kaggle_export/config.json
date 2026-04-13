@@ -1,0 +1,11 @@
+{
+  "_name_or_path": "google/mt5-small",
+  "architectures": ["MT5ForConditionalGeneration"],
+  "model_type": "mt5",
+  "vocab_size": 250112,
+  "d_model": 512,
+  "num_layers": 8,
+  "num_decoder_layers": 8,
+  "artifact_template": true,
+  "note": "Replace with real Kaggle-exported config for actual inference."
+}

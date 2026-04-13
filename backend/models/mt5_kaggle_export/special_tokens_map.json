@@ -1,0 +1,7 @@
+{
+  "unk_token": "<unk>",
+  "pad_token": "<pad>",
+  "eos_token": "</s>",
+  "artifact_template": true,
+  "note": "Replace with real special_tokens_map.json from model export."
+}

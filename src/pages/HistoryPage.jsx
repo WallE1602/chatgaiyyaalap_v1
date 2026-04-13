@@ -24,6 +24,41 @@ const toMillis = (ts) => {
   return Number.isNaN(asDate.getTime()) ? 0 : asDate.getTime()
 }
 
+const hasUserSenderMetadata = (msgs = []) => msgs.some((m) => m?.role === 'user' && !!m?.senderUid)
+
+const hasUserMessageFrom = (msgs = [], uid) => msgs.some((m) => m?.role === 'user' && m?.senderUid === uid)
+
+const hasPatientParticipation = (convo, viewerUid) => {
+  const msgs = convo.messages || []
+  // Legacy records may not include senderUid metadata.
+  if (!hasUserSenderMetadata(msgs)) return true
+  return hasUserMessageFrom(msgs, viewerUid)
+}
+
+const hasDoctorParticipation = (convo) => {
+  const msgs = convo.messages || []
+  if (!convo.doctorId) return false
+  // For old records without sender metadata, keep them visible if doctorId exists.
+  if (!hasUserSenderMetadata(msgs)) return true
+  return hasUserMessageFrom(msgs, convo.doctorId)
+}
+
+const isVisibleForRole = (convo, viewerUid, viewerRole) => {
+  if (viewerRole === 'doctor') {
+    if (convo.conversationType === 'patient_self') return false
+    return convo.doctorId === viewerUid && !!convo.patientId && hasDoctorParticipation(convo)
+  }
+  if (viewerRole === 'patient') {
+    if (convo.patientId !== viewerUid) return false
+    if (convo.conversationType === 'patient_self') return true
+    if (!convo.doctorId) {
+      return convo.conversationType === 'patient_self' || hasPatientParticipation(convo, viewerUid)
+    }
+    return hasDoctorParticipation(convo)
+  }
+  return false
+}
+
 const getThreadKey = (convo, viewerRole) => {
   if (convo.threadKey) return convo.threadKey
   if (viewerRole === 'patient' && convo.doctorId) return `doctor:${convo.doctorId}`
@@ -119,7 +154,7 @@ export default function HistoryPage() {
           if (!docMap.has(d.id)) docMap.set(d.id, { id: d.id, ...d.data() })
         })
 
-        const docs = Array.from(docMap.values())
+        const docs = Array.from(docMap.values()).filter((convo) => isVisibleForRole(convo, user.uid, user?.role))
         docs.sort((a, b) => toMillis(b.updatedAt || b.createdAt) - toMillis(a.updatedAt || a.createdAt))
 
         const grouped = new Map()
@@ -261,9 +296,12 @@ export default function HistoryPage() {
             const isExpanded = expandedId === convo.id
             const previewUser = msgs.find((m) => m.role === 'user')
             const previewBot = msgs.find((m) => m.role === 'bot')
+            const isPatientSelfSession = user?.role === 'patient' && convo.conversationType === 'patient_self'
             const counterpartName = user?.role === 'doctor'
               ? (convo.patientName || 'Patient')
-              : (convo.doctorName || (convo.doctorId ? `Doctor ${convo.doctorId.slice(0, 6)}` : 'Doctor'))
+              : (isPatientSelfSession
+                ? 'Personal Translation Session'
+                : (convo.doctorName || (convo.doctorId ? `Doctor ${convo.doctorId.slice(0, 6)}` : 'Doctor')))
 
             return (
               <div

@@ -1,0 +1,7 @@
+{
+  "model_max_length": 512,
+  "tokenizer_class": "T5Tokenizer",
+  "legacy": false,
+  "artifact_template": true,
+  "note": "Replace with real tokenizer_config.json from model export."
+}
