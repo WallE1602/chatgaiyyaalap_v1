@@ -29,7 +29,9 @@ export default function PhraseLibraryPage() {
   }
 
   const handlePhraseClick = (phrase) => {
-    navigate('/translate', { state: { prefill: phrase.chittagonian } })
+    navigate('/translate', {
+      state: { prefill: phrase.chittagonian, fromLang: 'chittagonian' },
+    })
   }
 
   return (

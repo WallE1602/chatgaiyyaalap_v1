@@ -14,7 +14,77 @@ import {
 import { useLanguage } from '../context/LanguageContext'
 import { useAuth } from '../context/AuthContext'
 import { db } from '../firebase'
-import { collection, query, where, getDocs, deleteDoc, doc } from 'firebase/firestore'
+import { collection, query, where, getDocs, getDoc, deleteDoc, doc } from 'firebase/firestore'
+
+const toMillis = (ts) => {
+  if (!ts) return 0
+  if (typeof ts.toMillis === 'function') return ts.toMillis()
+  if (typeof ts === 'number') return ts
+  const asDate = new Date(ts)
+  return Number.isNaN(asDate.getTime()) ? 0 : asDate.getTime()
+}
+
+const getThreadKey = (convo, viewerRole) => {
+  if (convo.threadKey) return convo.threadKey
+  if (viewerRole === 'patient' && convo.doctorId) return `doctor:${convo.doctorId}`
+  if (viewerRole === 'doctor' && convo.patientId) return `patient:${convo.patientId}`
+  if (convo.doctorId && convo.patientId) return `${convo.doctorId}__${convo.patientId}`
+  return convo.id
+}
+
+const formatProfileName = (profile, fallbackId) => {
+  if (!profile) return fallbackId
+  return profile.displayName || profile.name || profile.email || fallbackId
+}
+
+const hydrateParticipantNames = async (convos) => {
+  const missingIds = new Set()
+
+  convos.forEach((convo) => {
+    if (!convo.doctorName && convo.doctorId) missingIds.add(convo.doctorId)
+    if (!convo.patientName && convo.patientId) missingIds.add(convo.patientId)
+  })
+
+  if (missingIds.size === 0) return convos
+
+  const entries = await Promise.all(
+    Array.from(missingIds).map(async (uid) => {
+      try {
+        const snap = await getDoc(doc(db, 'users', uid))
+        if (!snap.exists()) return [uid, uid]
+        return [uid, formatProfileName(snap.data(), uid)]
+      } catch {
+        return [uid, uid]
+      }
+    }),
+  )
+
+  const nameByUid = new Map(entries)
+
+  return convos.map((convo) => ({
+    ...convo,
+    doctorName: convo.doctorName || (convo.doctorId ? nameByUid.get(convo.doctorId) : convo.doctorName),
+    patientName: convo.patientName || (convo.patientId ? nameByUid.get(convo.patientId) : convo.patientName),
+  }))
+}
+
+const mergeThreadMessages = (left = [], right = []) => {
+  const merged = new Map()
+  const add = (msg, idx, source) => {
+    const key = msg?.id
+      ? String(msg.id)
+      : `${msg?.role || 'unknown'}:${msg?.senderUid || 'anon'}:${msg?.timestamp || 0}:${idx}`
+
+    if (!merged.has(key) || source === 'right') {
+      merged.set(key, { ...msg, id: msg?.id ?? key })
+    }
+  }
+
+  left.forEach((msg, idx) => add(msg, idx, 'left'))
+  right.forEach((msg, idx) => add(msg, idx, 'right'))
+
+  return Array.from(merged.values()).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0))
+}
 
 export default function HistoryPage() {
   const { t } = useLanguage()
@@ -27,45 +97,90 @@ export default function HistoryPage() {
 
   useEffect(() => {
     if (!user?.uid) { setLoading(false); return }
-    // Query ended conversations where user is doctor OR patient
-    // Firestore doesn't support OR across fields, so we run two queries
-    const isDoctor = user?.role === 'doctor'
-    const q1 = query(
-      collection(db, 'conversations'),
-      where('doctorId', '==', user.uid),
-      where('status', '==', 'ended'),
-    )
-    const q2 = query(
-      collection(db, 'conversations'),
-      where('patientId', '==', user.uid),
-      where('status', '==', 'ended'),
-    )
+    let cancelled = false
 
-    Promise.all([getDocs(q1), getDocs(q2)])
-      .then(([snap1, snap2]) => {
+    const loadHistory = async () => {
+      try {
+        // Firestore doesn't support OR across fields, so we run two queries.
+        const q1 = query(
+          collection(db, 'conversations'),
+          where('doctorId', '==', user.uid),
+          where('status', '==', 'ended'),
+        )
+        const q2 = query(
+          collection(db, 'conversations'),
+          where('patientId', '==', user.uid),
+          where('status', '==', 'ended'),
+        )
+
+        const [snap1, snap2] = await Promise.all([getDocs(q1), getDocs(q2)])
         const docMap = new Map()
         ;[...snap1.docs, ...snap2.docs].forEach((d) => {
           if (!docMap.has(d.id)) docMap.set(d.id, { id: d.id, ...d.data() })
         })
-        const docs = Array.from(docMap.values())
-        docs.sort((a, b) => {
-          const ta = a.updatedAt?.toMillis?.() || 0
-          const tb = b.updatedAt?.toMillis?.() || 0
-          return tb - ta
-        })
-        setConversations(docs)
-      })
-      .catch((err) => {
-        console.error('Failed to load conversations:', err)
-        toast.error('Failed to load history')
-      })
-      .finally(() => setLoading(false))
-  }, [user])
 
-  const handleDelete = async (id) => {
+        const docs = Array.from(docMap.values())
+        docs.sort((a, b) => toMillis(b.updatedAt || b.createdAt) - toMillis(a.updatedAt || a.createdAt))
+
+        const grouped = new Map()
+        docs.forEach((convo) => {
+          const groupId = getThreadKey(convo, user?.role)
+          const current = grouped.get(groupId)
+
+          if (!current) {
+            grouped.set(groupId, {
+              ...convo,
+              id: groupId,
+              sourceIds: [convo.id],
+              messages: [...(convo.messages || [])],
+            })
+            return
+          }
+
+          current.sourceIds = Array.from(new Set([...(current.sourceIds || []), convo.id]))
+          current.messages = mergeThreadMessages(current.messages || [], convo.messages || [])
+
+          if (toMillis(convo.updatedAt || convo.createdAt) >= toMillis(current.updatedAt || current.createdAt)) {
+            current.updatedAt = convo.updatedAt || current.updatedAt
+            current.doctorName = convo.doctorName || current.doctorName
+            current.patientName = convo.patientName || current.patientName
+            current.doctorId = convo.doctorId || current.doctorId
+            current.patientId = convo.patientId || current.patientId
+            current.fromLang = convo.fromLang || current.fromLang
+          }
+        })
+
+        const groupedDocs = Array.from(grouped.values())
+        groupedDocs.sort((a, b) => toMillis(b.updatedAt || b.createdAt) - toMillis(a.updatedAt || a.createdAt))
+
+        const hydratedDocs = await hydrateParticipantNames(groupedDocs)
+
+        if (!cancelled) {
+          setConversations(hydratedDocs)
+        }
+      } catch (err) {
+        console.error('Failed to load conversations:', err)
+        if (!cancelled) {
+          toast.error('Failed to load history')
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false)
+        }
+      }
+    }
+
+    loadHistory()
+    return () => {
+      cancelled = true
+    }
+  }, [user?.uid, user?.role])
+
+  const handleDelete = async (convo) => {
+    const ids = Array.from(new Set(convo.sourceIds?.length ? convo.sourceIds : [convo.id]))
     try {
-      await deleteDoc(doc(db, 'conversations', id))
-      setConversations((prev) => prev.filter((c) => c.id !== id))
+      await Promise.all(ids.map((id) => deleteDoc(doc(db, 'conversations', id))))
+      setConversations((prev) => prev.filter((c) => c.id !== convo.id))
       toast.success(t('history.deleteConfirm'))
     } catch {
       toast.error('Failed to delete')
@@ -94,7 +209,7 @@ export default function HistoryPage() {
 
   const formatTime = (ts) => {
     if (!ts) return ''
-    const d = new Date(ts)
+    const d = ts.toDate ? ts.toDate() : new Date(ts)
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   }
 
@@ -146,6 +261,9 @@ export default function HistoryPage() {
             const isExpanded = expandedId === convo.id
             const previewUser = msgs.find((m) => m.role === 'user')
             const previewBot = msgs.find((m) => m.role === 'bot')
+            const counterpartName = user?.role === 'doctor'
+              ? (convo.patientName || 'Patient')
+              : (convo.doctorName || (convo.doctorId ? `Doctor ${convo.doctorId.slice(0, 6)}` : 'Doctor'))
 
             return (
               <div
@@ -162,7 +280,7 @@ export default function HistoryPage() {
                       </div>
                       <div className="min-w-0">
                         <p className="text-sm font-semibold text-[#1E293B] truncate">
-                          {convo.patientName || 'Patient'}
+                          {counterpartName}
                         </p>
                         <div className="flex items-center gap-2 text-[11px] text-[#94A3B8]">
                           <span>{msgCount} message{msgCount !== 1 ? 's' : ''}</span>
@@ -183,7 +301,7 @@ export default function HistoryPage() {
                         {isExpanded ? <ChevronUpIcon className="h-3.5 w-3.5" /> : <ChevronDownIcon className="h-3.5 w-3.5" />}
                       </button>
                       <button
-                        onClick={() => handleDelete(convo.id)}
+                        onClick={() => handleDelete(convo)}
                         title="Delete"
                         className="p-1.5 rounded-lg border border-slate-200 text-[#64748B] hover:text-red-500 hover:border-red-300 transition-colors"
                       >

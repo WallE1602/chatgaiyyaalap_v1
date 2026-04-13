@@ -17,11 +17,98 @@ import {
 import { MicrophoneIcon as MicSolid } from '@heroicons/react/24/solid'
 import { lookupPhrase } from '../utils/phraseLookup'
 import { db } from '../firebase'
-import { collection, addDoc, getDocs, getDoc, setDoc, deleteDoc, doc, query, where, serverTimestamp } from 'firebase/firestore'
+import { collection, addDoc, getDocs, getDoc, setDoc, deleteDoc, doc, query, where, serverTimestamp, runTransaction } from 'firebase/firestore'
 import { useLanguage } from '../context/LanguageContext'
 import { useAuth } from '../context/AuthContext'
 
-let msgId = 0
+const toMillis = (ts) => {
+  if (!ts) return 0
+  if (typeof ts.toMillis === 'function') return ts.toMillis()
+  if (typeof ts === 'number') return ts
+  const asDate = new Date(ts)
+  return Number.isNaN(asDate.getTime()) ? 0 : asDate.getTime()
+}
+
+const makeThreadKey = (doctorId, patientId) => {
+  if (!doctorId || !patientId) return null
+  return `${doctorId}__${patientId}`
+}
+
+const makeMessageId = (seed = 'msg') => `${seed}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+const LOCAL_ONGOING_KEY_PREFIX = 'chatgaiyyaalap_ongoing_conversation_'
+
+const getLocalOngoingKey = (uid) => `${LOCAL_ONGOING_KEY_PREFIX}${uid}`
+
+const readLocalOngoingConversation = (uid) => {
+  if (!uid || typeof window === 'undefined') return null
+  try {
+    const raw = window.localStorage.getItem(getLocalOngoingKey(uid))
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed?.messages) || parsed.messages.length === 0) return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+const writeLocalOngoingConversation = (uid, payload) => {
+  if (!uid || typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(getLocalOngoingKey(uid), JSON.stringify(payload))
+  } catch {
+    // Ignore storage write failures (private mode/quota).
+  }
+}
+
+const clearLocalOngoingConversation = (uid) => {
+  if (!uid || typeof window === 'undefined') return
+  try {
+    window.localStorage.removeItem(getLocalOngoingKey(uid))
+  } catch {
+    // Ignore storage cleanup failures.
+  }
+}
+
+const normalizeFirestoreErrorCode = (err) => {
+  const raw = typeof err?.code === 'string' ? err.code : ''
+  if (!raw) return ''
+  return raw.startsWith('firestore/') ? raw.slice('firestore/'.length) : raw
+}
+
+const getSyncFailureMessage = (err) => {
+  const code = normalizeFirestoreErrorCode(err)
+  if (code === 'permission-denied') {
+    return 'Cloud sync blocked by Firebase rules. Conversation kept on this device.'
+  }
+  if (code === 'failed-precondition') {
+    return 'Cloud sync requires a Firestore index. Conversation kept on this device.'
+  }
+  if (code === 'unavailable') {
+    return 'Cloud sync is temporarily unavailable. Conversation kept on this device.'
+  }
+  return 'Cloud sync failed. Conversation kept on this device.'
+}
+
+const mergeConversationMessages = (existing = [], incoming = []) => {
+  const merged = new Map()
+
+  const addMessage = (msg, index, source) => {
+    const key = msg?.id
+      ? String(msg.id)
+      : `${msg?.role || 'unknown'}:${msg?.senderUid || 'anon'}:${msg?.timestamp || 0}:${index}`
+
+    // Prefer the latest incoming payload for identical IDs.
+    if (!merged.has(key) || source === 'incoming') {
+      merged.set(key, { ...msg, id: msg?.id ?? key })
+    }
+  }
+
+  existing.forEach((msg, idx) => addMessage(msg, idx, 'existing'))
+  incoming.forEach((msg, idx) => addMessage(msg, idx, 'incoming'))
+
+  return Array.from(merged.values()).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0))
+}
 
 export default function TranslationPage() {
   const location = useLocation()
@@ -46,6 +133,7 @@ export default function TranslationPage() {
   const [isListening, setIsListening] = useState(false)
   const [fromLang, setFromLang] = useState('chittagonian')
   const [conversationId, setConversationId] = useState(null)
+  const [activeDoctor, setActiveDoctor] = useState(null)
   const [convoLoading, setConvoLoading] = useState(true)
 
   const chatEndRef = useRef(null)
@@ -54,7 +142,22 @@ export default function TranslationPage() {
   const silenceTimerRef = useRef(null)
   const draftTimerRef = useRef(null)
   const inputTextRef = useRef(inputText)
+  const messagesRef = useRef(messages)
+  const conversationIdRef = useRef(conversationId)
+  const activeDoctorRef = useRef(null)
   inputTextRef.current = inputText
+
+  useEffect(() => {
+    messagesRef.current = messages
+  }, [messages])
+
+  useEffect(() => {
+    conversationIdRef.current = conversationId
+  }, [conversationId])
+
+  useEffect(() => {
+    activeDoctorRef.current = activeDoctor
+  }, [activeDoctor])
 
   const toLang = fromLang === 'chittagonian' ? 'bangla' : 'chittagonian'
 
@@ -95,25 +198,41 @@ export default function TranslationPage() {
       )
     : allPatients
 
+  // Refresh selected patient details when the patient list finishes loading.
+  useEffect(() => {
+    if (!isDoctor || !selectedPatient?.id || allPatients.length === 0) return
+    const match = allPatients.find((p) => p.id === selectedPatient.id)
+    if (!match) return
+
+    const nameChanged = (selectedPatient.name || '') !== (match.name || '')
+    const emailChanged = (selectedPatient.email || '') !== (match.email || '')
+    const avatarChanged = (selectedPatient.avatar || '') !== (match.avatar || '')
+    if (nameChanged || emailChanged || avatarChanged) {
+      setSelectedPatient(match)
+    }
+  }, [isDoctor, allPatients, selectedPatient?.id, selectedPatient?.name, selectedPatient?.email, selectedPatient?.avatar])
+
   const handleSelectPatient = async (patient) => {
     setSelectedPatient(patient)
     setShowPatientPicker(false)
     setPatientSearch('')
     setMessages([])
     setConversationId(null)
+    setActiveDoctor(null)
     // Load active conversation for this patient
     await loadActiveConversation(patient.id)
   }
 
   const handleChangePatient = async () => {
     // End current conversation if messages exist before switching
-    if (messages.length > 0 && conversationId) {
+    if (messages.length > 0) {
       await endConversation(true)
     }
     setSelectedPatient(null)
     setShowPatientPicker(true)
     setMessages([])
     setConversationId(null)
+    setActiveDoctor(null)
   }
 
   // ── Load active conversation from Firestore ─────────────────────
@@ -121,7 +240,6 @@ export default function TranslationPage() {
     if (!user?.uid) return
     setConvoLoading(true)
     try {
-      // Doctor queries by doctorId, patient queries by patientId
       const ownerField = isDoctor ? 'doctorId' : 'patientId'
       const constraints = [
         where(ownerField, '==', user.uid),
@@ -131,32 +249,46 @@ export default function TranslationPage() {
 
       const q = query(collection(db, 'conversations'), ...constraints)
       const snap = await getDocs(q)
-      if (!snap.empty) {
-        // Pick the most recently updated conversation
-        const docs = snap.docs.map((d) => ({ id: d.id, ...d.data() }))
-        docs.sort((a, b) => {
-          const ta = a.updatedAt?.toMillis?.() || 0
-          const tb = b.updatedAt?.toMillis?.() || 0
-          return tb - ta
-        })
-        const best = docs[0]
+      const docs = snap.docs.map((d) => ({ id: d.id, ...d.data() }))
+      docs.sort((a, b) => toMillis(b.updatedAt) - toMillis(a.updatedAt))
+
+      // Ignore legacy malformed active records for patients.
+      const candidates = isDoctor ? docs : docs.filter((item) => !!item.doctorId)
+      const best = candidates[0]
+
+      if (best) {
         setConversationId(best.id)
         setMessages(best.messages || [])
         if (best.fromLang) setFromLang(best.fromLang)
-        // Restore msgId counter to avoid collisions
-        const maxId = (best.messages || []).reduce((max, m) => Math.max(max, m.id || 0), 0)
-        msgId = maxId
-        // For doctors, restore patient
-        if (isDoctor && best.patientId && !patientId) {
-          const patient = allPatients.find((p) => p.id === best.patientId)
-          if (patient) {
-            setSelectedPatient(patient)
-            setShowPatientPicker(false)
-          }
+
+        if (!isDoctor) {
+          const doctorCtx = best.doctorId
+            ? { id: best.doctorId, name: best.doctorName || 'Doctor' }
+            : null
+          setActiveDoctor(doctorCtx)
         }
+
+        if (isDoctor && best.patientId && !patientId) {
+          const patient = allPatients.find((p) => p.id === best.patientId) || {
+            id: best.patientId,
+            uid: best.patientId,
+            name: best.patientName || `Patient ${best.patientId.slice(0, 6)}`,
+            email: '',
+            avatar: null,
+          }
+          setSelectedPatient(patient)
+          setShowPatientPicker(false)
+        }
+        return true
+      } else {
+        setConversationId(null)
+        setMessages([])
+        if (!isDoctor) setActiveDoctor(null)
+        return false
       }
     } catch (err) {
       console.error('loadActiveConversation failed:', err)
+      return false
     } finally {
       setConvoLoading(false)
     }
@@ -166,43 +298,151 @@ export default function TranslationPage() {
   const persistConversation = async (msgs, convoId) => {
     if (!user?.uid) return convoId
 
-    // If no convoId yet, check if the other party already created one
-    if (!convoId) {
+    let resolvedConvoId = convoId
+    let existingData = null
+
+    if (resolvedConvoId) {
+      try {
+        const existingSnap = await getDoc(doc(db, 'conversations', resolvedConvoId))
+        if (existingSnap.exists()) {
+          existingData = existingSnap.data()
+
+          // Do not reuse ended records; each new active chat should get its own
+          // active doc (history keeps ended sessions grouped by thread later).
+          if (existingData.status === 'ended') {
+            resolvedConvoId = null
+            existingData = null
+          }
+
+          // Guard against reusing a previous patient's conversation when doctor
+          // switches context quickly.
+          if (isDoctor && existingData) {
+            if (existingData.doctorId && existingData.doctorId !== user.uid) {
+              resolvedConvoId = null
+              existingData = null
+            }
+            if (selectedPatient?.id && existingData?.patientId && existingData.patientId !== selectedPatient.id) {
+              resolvedConvoId = null
+              existingData = null
+            }
+          }
+
+          // Patient account should not reuse conversation IDs that belong to
+          // a different patient record.
+          if (!isDoctor && existingData && existingData.patientId && existingData.patientId !== user.uid) {
+            resolvedConvoId = null
+            existingData = null
+          }
+        } else {
+          // Stale local ID: recreate a fresh conversation document.
+          resolvedConvoId = null
+        }
+      } catch (err) {
+        console.error('persistConversation existing doc read failed:', err)
+        // If read is blocked or fails for this ID, fallback to a fresh create path.
+        resolvedConvoId = null
+      }
+    }
+
+    if (!resolvedConvoId) {
       const lookupField = isDoctor ? 'doctorId' : 'patientId'
-      const otherField = isDoctor ? 'patientId' : 'doctorId'
-      const otherValue = isDoctor ? (selectedPatient?.id || null) : null
-      const constraints = [
-        where(lookupField, '==', user.uid),
-        where('status', '==', 'active'),
-      ]
-      if (otherValue) constraints.push(where(otherField, '==', otherValue))
+      const constraints = [where(lookupField, '==', user.uid), where('status', '==', 'active')]
+      if (isDoctor && selectedPatient?.id) constraints.push(where('patientId', '==', selectedPatient.id))
+
       try {
         const existingSnap = await getDocs(query(collection(db, 'conversations'), ...constraints))
         if (!existingSnap.empty) {
-          convoId = existingSnap.docs[0].id
+          const docs = existingSnap.docs.map((d) => ({ id: d.id, ...d.data() }))
+          docs.sort((a, b) => toMillis(b.updatedAt) - toMillis(a.updatedAt))
+
+          const best = isDoctor ? docs[0] : docs.find((item) => !!item.doctorId) || docs[0]
+          resolvedConvoId = best.id
+          existingData = best
         }
-      } catch { /* proceed to create new */ }
+      } catch (err) {
+        console.error('persistConversation active lookup failed:', err)
+      }
     }
 
-    const data = {
-      doctorId: isDoctor ? user.uid : null,
-      doctorName: isDoctor ? user.name : null,
-      patientId: isDoctor ? (selectedPatient?.id || null) : user.uid,
-      patientName: isDoctor ? (selectedPatient?.name || 'Unknown') : user.name,
+    let doctorId = isDoctor ? user.uid : (existingData?.doctorId || activeDoctorRef.current?.id || null)
+    let doctorName = isDoctor ? user.name : (existingData?.doctorName || activeDoctorRef.current?.name || null)
+    const patientId = isDoctor ? (selectedPatient?.id || existingData?.patientId || null) : user.uid
+    const patientName = isDoctor
+      ? (selectedPatient?.name || existingData?.patientName || 'Unknown')
+      : (user.name || existingData?.patientName || 'Patient')
+
+    if (!doctorId && !isDoctor) {
+      try {
+        const endedSnap = await getDocs(
+          query(
+            collection(db, 'conversations'),
+            where('patientId', '==', user.uid),
+            where('status', '==', 'ended'),
+          ),
+        )
+        const endedDocs = endedSnap.docs
+          .map((d) => ({ id: d.id, ...d.data() }))
+          .filter((item) => !!item.doctorId)
+        endedDocs.sort((a, b) => toMillis(b.updatedAt) - toMillis(a.updatedAt))
+
+        if (endedDocs[0]) {
+          doctorId = endedDocs[0].doctorId
+          doctorName = endedDocs[0].doctorName || doctorName
+          setActiveDoctor({ id: doctorId, name: doctorName || 'Doctor' })
+        }
+      } catch (err) {
+        console.error('persistConversation ended lookup failed:', err)
+      }
+    }
+
+    // Patient-side chats without a doctor thread are kept locally and should
+    // not attempt cloud sync, which can trigger rule errors.
+    if (!isDoctor && !doctorId) {
+      return null
+    }
+
+    if (isDoctor && !patientId) {
+      return null
+    }
+
+    const threadKey = makeThreadKey(doctorId, patientId)
+
+    const basePayload = {
+      patientId,
+      patientName,
       status: 'active',
       fromLang,
-      messages: msgs,
       updatedAt: serverTimestamp(),
     }
+    if (doctorId) basePayload.doctorId = doctorId
+    if (doctorName) basePayload.doctorName = doctorName
+    if (threadKey) basePayload.threadKey = threadKey
 
-    if (convoId) {
-      await setDoc(doc(db, 'conversations', convoId), data, { merge: true })
-      return convoId
-    } else {
-      data.createdAt = serverTimestamp()
-      const ref = await addDoc(collection(db, 'conversations'), data)
-      return ref.id
+    // New conversation create should avoid tx.get(non-existent doc), which can
+    // be denied by stricter Firestore read rules.
+    if (!resolvedConvoId) {
+      const newRef = doc(collection(db, 'conversations'))
+      await setDoc(newRef, {
+        ...basePayload,
+        messages: [...msgs],
+        createdAt: serverTimestamp(),
+      }, { merge: true })
+      return newRef.id
     }
+
+    const convoRef = doc(db, 'conversations', resolvedConvoId)
+    await runTransaction(db, async (tx) => {
+      const snap = await tx.get(convoRef)
+      const base = snap.exists() ? snap.data() : (existingData || {})
+      const mergedMessages = mergeConversationMessages(base.messages || [], msgs)
+
+      tx.set(convoRef, {
+        ...basePayload,
+        messages: mergedMessages,
+      }, { merge: true })
+    })
+
+    return convoRef.id
   }
 
   // ── End / save conversation ─────────────────────────────────────
@@ -212,23 +452,14 @@ export default function TranslationPage() {
       return
     }
     try {
-      if (conversationId) {
-        await setDoc(doc(db, 'conversations', conversationId), { status: 'ended', updatedAt: serverTimestamp() }, { merge: true })
-      } else {
-        // Create and immediately end
-        const data = {
-          doctorId: isDoctor ? user.uid : null,
-          doctorName: isDoctor ? user.name : null,
-          patientId: isDoctor ? (selectedPatient?.id || null) : user.uid,
-          patientName: isDoctor ? (selectedPatient?.name || 'Unknown') : user.name,
-          status: 'ended',
-          fromLang,
-          messages: [...messages],
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        }
-        await addDoc(collection(db, 'conversations'), data)
+      let targetId = conversationIdRef.current
+      if (!targetId) {
+        targetId = await persistConversation([...messagesRef.current], null)
       }
+      if (targetId) {
+        await setDoc(doc(db, 'conversations', targetId), { status: 'ended', updatedAt: serverTimestamp() }, { merge: true })
+      }
+
       // Clear draft
       deleteDoc(doc(db, 'drafts', user.uid)).catch(() => {})
       if (!silent) toast.success(t('translate.conversationSaved'))
@@ -259,9 +490,32 @@ export default function TranslationPage() {
       // Patients: load active conversation immediately
       // Doctors: wait for patient selection (handled in handleSelectPatient)
       if (!isDoctor) {
-        await loadActiveConversation()
+        const loadedRemote = await loadActiveConversation()
+        if (!loadedRemote) {
+          const localOngoing = readLocalOngoingConversation(user.uid)
+          if (localOngoing) {
+            setMessages(localOngoing.messages || [])
+            setConversationId(localOngoing.conversationId || null)
+            if (localOngoing.fromLang) setFromLang(localOngoing.fromLang)
+            if (localOngoing.activeDoctor?.id) {
+              setActiveDoctor(localOngoing.activeDoctor)
+            }
+          }
+        }
       } else {
-        setConvoLoading(false)
+        const loadedRemote = await loadActiveConversation()
+        if (!loadedRemote) {
+          const localOngoing = readLocalOngoingConversation(user.uid)
+          if (localOngoing) {
+            setMessages(localOngoing.messages || [])
+            setConversationId(localOngoing.conversationId || null)
+            if (localOngoing.fromLang) setFromLang(localOngoing.fromLang)
+            if (localOngoing.selectedPatient?.id) {
+              setSelectedPatient(localOngoing.selectedPatient)
+              setShowPatientPicker(false)
+            }
+          }
+        }
       }
       // Load draft
       try {
@@ -274,7 +528,33 @@ export default function TranslationPage() {
       }
     }
     init()
-  }, [user?.uid])
+  }, [user?.uid, isDoctor])
+
+  // Keep a local backup of ongoing patient conversations to survive route changes.
+  useEffect(() => {
+    if (!user?.uid) return
+    if (messages.length === 0) {
+      clearLocalOngoingConversation(user.uid)
+      return
+    }
+
+    const backup = {
+      conversationId,
+      fromLang,
+      messages,
+      updatedAt: Date.now(),
+    }
+
+    if (isDoctor) {
+      backup.selectedPatient = selectedPatient
+    } else {
+      backup.activeDoctor = activeDoctor
+    }
+
+    writeLocalOngoingConversation(user.uid, {
+      ...backup,
+    })
+  }, [user?.uid, isDoctor, messages, conversationId, fromLang, activeDoctor, selectedPatient])
 
   // ── Save draft on unmount ──────────────────────────────────────
   useEffect(() => {
@@ -318,8 +598,11 @@ export default function TranslationPage() {
       const trimmed = (text ?? inputText).trim()
       if (!trimmed || isLoading) return
 
+      const baseMessages = [...messagesRef.current]
+      const activeConvoId = conversationIdRef.current
+
       const userMsg = {
-        id: ++msgId,
+        id: makeMessageId(user?.uid || 'user'),
         role: 'user',
         senderUid: user.uid,
         senderName: user.name || user.email,
@@ -330,7 +613,8 @@ export default function TranslationPage() {
         timestamp: Date.now(),
       }
 
-      setMessages((prev) => [...prev, userMsg])
+      const messagesWithUser = [...baseMessages, userMsg]
+      setMessages(messagesWithUser)
       setInputText('')
       setIsLoading(true)
 
@@ -339,7 +623,7 @@ export default function TranslationPage() {
         await new Promise((r) => setTimeout(r, 300))
         const { result, matched, type } = lookupPhrase(trimmed)
         const botMsg = {
-          id: ++msgId,
+          id: makeMessageId('bot'),
           role: 'bot',
           text: result,
           matchType: type,
@@ -349,13 +633,20 @@ export default function TranslationPage() {
           timestamp: Date.now(),
         }
 
-        const updatedMessages = [...messages, userMsg, botMsg]
+        const updatedMessages = [...messagesWithUser, botMsg]
         setMessages(updatedMessages)
 
         // Persist conversation to Firestore
-        persistConversation(updatedMessages, conversationId)
-          .then((newId) => { if (!conversationId) setConversationId(newId) })
-          .catch((err) => console.error('persistConversation failed:', err))
+        try {
+          const newId = await persistConversation(updatedMessages, activeConvoId)
+          if (newId && newId !== conversationIdRef.current) {
+            setConversationId(newId)
+          }
+        } catch (err) {
+          const code = normalizeFirestoreErrorCode(err)
+          console.error('persistConversation failed:', { code, err })
+          toast.error(getSyncFailureMessage(err), { id: 'sync-failed' })
+        }
 
         // Clear draft after successful send
         if (user?.uid) {
@@ -379,7 +670,7 @@ export default function TranslationPage() {
         inputRef.current?.focus()
       }
     },
-    [inputText, isLoading, fromLang, toLang, t, messages, conversationId, user],
+    [inputText, isLoading, fromLang, toLang, t, user],
   )
 
   // ── Swap languages ──────────────────────────────────────────────
